@@ -5,17 +5,27 @@
 // @name:ja            Misskey タイムライン改善：戻ったときに元の位置へ
 // @namespace          https://github.com/TW527E/Misskey-Timeline-Improvement
 // @version            0.1.0
-// @description        Like Twitter/X: open a note, go back, and the Misskey / Sharkey timeline is exactly where you left off — even after the page cache was evicted, the tab was reloaded, or you switched timeline tabs.
-// @description:zh-TW  像推特一樣：點開貼文後按返回，Misskey / Sharkey 的時間線會回到你離開時的位置（頁面快取被清掉、重新整理、切換時間線分頁也一樣）。
-// @description:zh-CN  像推特一样：点开帖子后按返回，Misskey / Sharkey 的时间线会回到你离开时的位置（页面缓存被清除、刷新、切换时间线标签也一样）。
-// @description:ja     Twitter/X のように、ノートを開いて戻ると Misskey / Sharkey のタイムラインが元の位置に戻ります（ページキャッシュが破棄された場合・再読み込み・タブ切り替えにも対応）。
+// @description        Like Twitter/X: the Misskey / Sharkey timeline remembers where you were — go back from a note, reload, switch tabs, or open it again tomorrow, and you continue where you left off.
+// @description:zh-TW  像推特一樣：Misskey / Sharkey 的時間線會記住你看到哪裡。點開貼文再返回、重新整理、切換分頁，或隔天再打開，都會回到上次離開的位置。
+// @description:zh-CN  像推特一样：Misskey / Sharkey 的时间线会记住你看到哪里。点开帖子再返回、刷新、切换标签，或隔天再打开，都会回到上次离开的位置。
+// @description:ja     Twitter/X のように、Misskey / Sharkey のタイムラインがどこまで読んだかを覚えます。ノートから戻る・再読み込み・タブ切り替え・翌日に開き直したときも、前回の位置から続きを読めます。
 // @author             誠誠-ChengCheng
 // @license            MIT
 // @homepageURL        https://github.com/TW527E/Misskey-Timeline-Improvement
 // @supportURL         https://github.com/TW527E/Misskey-Timeline-Improvement/issues
 // @downloadURL        https://raw.githubusercontent.com/TW527E/Misskey-Timeline-Improvement/main/misskey-timeline-improvement.user.js
 // @updateURL          https://raw.githubusercontent.com/TW527E/Misskey-Timeline-Improvement/main/misskey-timeline-improvement.user.js
-// @match              *://*/*
+// @match              https://dvd.chat/*
+// @match              https://misskey.io/*
+// @match              https://misskey.design/*
+// @match              https://nijimiss.moe/*
+// @match              https://sushi.ski/*
+// @match              https://misskey.art/*
+// @match              https://voskey.icalo.net/*
+// @match              https://misskey.niri.la/*
+// @match              https://misskey.cloud/*
+// @match              https://transfem.social/*
+// @match              https://blahaj.zone/*
 // @run-at             document-start
 // @grant              none
 // @noframes
@@ -55,10 +65,18 @@
 		restoreOnReload: true,
 		/** Give every timeline tab (Home / Local / Social / ...) its own remembered position. */
 		restoreOnTabSwitch: true,
+		/** Opening a timeline again later (new tab, next day, Home button...) continues where you left off. */
+		restoreOnOpen: true,
 		/** How many times "load more" may be pressed to find the note you left off at. */
 		maxLoadPages: 30,
-		/** Same, for lists that are not ordered by time (e.g. recommendation feeds). */
-		maxLoadPagesUnordered: 5,
+		/** Same, when continuing from a previous visit (it may be far back if many notes arrived since). */
+		maxLoadPagesOnOpen: 10,
+		/**
+		 * Same, for lists that are not ordered by time (recommendations, featured notes). These come
+		 * back different every time they are rebuilt, so by default only the notes already on screen
+		 * are searched instead of fetching more of the feed.
+		 */
+		maxLoadPagesUnordered: 0,
 		/** Show a small progress toast while older notes are being loaded. */
 		showToast: true,
 		/** Log what the script is doing to the console. */
@@ -69,9 +87,11 @@
 
 	const ANCHOR = '[data-scroll-anchor]';
 	const STORE_KEY = NS + ':state';
+	const LAST_VISIT_KEY = NS + ':last:';
 	const HISTORY_KEY = '__mtiKey';
 	const MAX_ENTRIES = 100;
 	const MAX_TABS_PER_ENTRY = 12;
+	const MAX_LAST_VISIT = 30;
 	const PENDING_TIMEOUT = 20000;
 	const NO_SNAPSHOT_GRACE = 1500;
 	const SETTLE_MS = 1500;
@@ -80,12 +100,15 @@
 	let enabled = false;
 	/** The history entry currently shown: { key, path }. */
 	const cur = { key: null, path: currentPath() };
-	/** A restore waiting for the target page to render: { key, reason, since, ignore, seenAt }. */
+	/** A restore waiting for the target page to render: { key, reason, fromLastVisit, since, ignore, seenAt }. */
 	let pending = null;
 	/** The restore in progress: { cancelled }. */
 	let restoring = null;
 	let lastResult = null;
+	/** Positions per history entry, for this browser tab (sessionStorage). */
 	let store = { v: 1, entries: {} };
+	/** The latest position of each timeline, kept across visits (localStorage, per account). */
+	let lastVisit = { v: 1, tabs: {} };
 
 	/** List roots we've already seen, and which timeline identity each one belongs to. */
 	const seenLists = new WeakSet();
@@ -128,6 +151,7 @@
 		if (enabled) return;
 		enabled = true;
 		store = loadStore();
+		lastVisit = loadLastVisit();
 		installHistoryHooks();
 
 		document.addEventListener('scroll', onScroll, { capture: true, passive: true });
@@ -156,6 +180,7 @@
 			version: VERSION,
 			config: CONFIG,
 			get state() { return store; },
+			get lastVisit() { return lastVisit; },
 			get last() { return lastResult; },
 			capture: captureNow,
 		};
@@ -168,8 +193,10 @@
 		const origReplace = H.replaceState;
 
 		H.pushState = function pushState(state, unused, url) {
+			let leaving = null;
 			guard(() => {
 				// The DOM still shows the page we're leaving: record where we were.
+				leaving = findContainer();
 				captureNow();
 				cancelAll();
 			});
@@ -177,6 +204,9 @@
 			const ret = origPush.call(this, tagState(state, key), unused, url);
 			cur.key = key;
 			cur.path = currentPath();
+			// Going to a timeline (e.g. the Home button): continue where you left off, also when
+			// Misskey brings back its cached copy of the page.
+			guard(() => armResume(leaving));
 			return ret;
 		};
 
@@ -279,6 +309,7 @@
 		e.t = Date.now();
 		e.tabs[id] = snap;
 		e.last = id;
+		if (isTimelinePath(cur.path)) lastVisit.tabs[id] = snap;
 		scheduleSave();
 	}
 
@@ -332,7 +363,19 @@
 	function armPending(reason, ignoreContainer) {
 		const e = cur.key ? getEntry(cur.key, false) : null;
 		if (!e || Object.keys(e.tabs).length === 0) return;
-		const p = { key: cur.key, reason, since: Date.now(), ignore: ignoreContainer || null, seenAt: 0 };
+		setPending({ key: cur.key, reason, fromLastVisit: false, ignore: ignoreContainer || null });
+	}
+
+	/** Waits for the timeline we just navigated to, then continues from the last visit. */
+	function armResume(ignoreContainer) {
+		if (!CONFIG.restoreOnOpen || !cur.key || !isTimelinePath(cur.path)) return;
+		const prefix = cur.path + '|';
+		if (!Object.keys(lastVisit.tabs).some((id) => id.startsWith(prefix))) return;
+		setPending({ key: cur.key, reason: 'open', fromLastVisit: true, ignore: ignoreContainer || null });
+	}
+
+	function setPending(fields) {
+		const p = Object.assign({ since: Date.now(), seenAt: 0 }, fields);
 		pending = p;
 		setTimeout(() => {
 			if (pending === p) pending = null;
@@ -355,13 +398,14 @@
 
 		const id = identityOf(c);
 		const e = getEntry(p.key, false);
-		const snap = e && e.tabs[id];
+		const snap = p.fromLastVisit ? lastVisit.tabs[id] : e && e.tabs[id];
 		if (!snap) {
 			// The header might not be fully rendered yet; give it a moment before giving up.
 			if (!p.seenAt) p.seenAt = Date.now();
 			if (Date.now() - p.seenAt < NO_SNAPSHOT_GRACE) return pollLater();
 			pending = null;
 			registerList(c, listRoot(anchors), id, true);
+			resumeLastVisit(c, id);
 			return;
 		}
 
@@ -381,11 +425,27 @@
 
 		const id = identityOf(c);
 		const prev = registerList(c, root, id, true);
+		// The first list on this page (a fresh visit): continue from the previous visit.
+		if (!prev) {
+			resumeLastVisit(c, id);
+			return;
+		}
 		// Same tab as before = the list was refreshed on purpose (pull to refresh, filter change).
-		if (!CONFIG.restoreOnTabSwitch || !prev || prev === id) return;
+		if (!CONFIG.restoreOnTabSwitch || prev === id) return;
 		const e = getEntry(cur.key, false);
 		const snap = e && e.tabs[id];
-		if (snap && !snap.top) restore(c, snap, 'tab');
+		if (snap) {
+			if (!snap.top) restore(c, snap, 'tab');
+		} else {
+			resumeLastVisit(c, id);
+		}
+	}
+
+	/** Continues where you left off last time you had this timeline open. */
+	function resumeLastVisit(c, id) {
+		if (!CONFIG.restoreOnOpen || !isTimelinePath(cur.path)) return;
+		const snap = lastVisit.tabs[id];
+		if (snap && !snap.top) restore(c, snap, 'open');
 	}
 
 	/** Remembers a list root; returns the identity the current entry showed before. */
@@ -428,10 +488,12 @@
 		let result = 'notfound';
 		let pages = 0;
 		let settledOnce = false;
+		let limit = snap.chrono ? CONFIG.maxLoadPages : CONFIG.maxLoadPagesUnordered;
+		if (reason === 'open') limit = Math.min(limit, CONFIG.maxLoadPagesOnOpen);
+		const startScrollTop = c.scrollTop;
 		log('restore start', reason, snap);
 
 		try {
-			const limit = snap.chrono ? CONFIG.maxLoadPages : CONFIG.maxLoadPagesUnordered;
 			const deadline = Date.now() + RESTORE_DEADLINE;
 			for (;;) {
 				if (job.cancelled || !c.isConnected) {
@@ -457,13 +519,13 @@
 					result = hit.exact ? 'restored' : 'approximate';
 					break;
 				}
-				if (pages >= limit || Date.now() > deadline) break;
 				if (!settledOnce) {
 					// Let the first page finish rendering before deciding to load more.
 					settledOnce = true;
 					await waitStable(c, job);
 					continue;
 				}
+				if (pages >= limit || Date.now() > deadline) break;
 
 				const more = findLoadMore(c);
 				if (more === 'end') break;
@@ -486,8 +548,11 @@
 			if (restoring === job) restoring = null;
 		}
 
-		if (result === 'notfound' && !job.cancelled) {
-			flashToast(t('notFound'));
+		if (result === 'notfound' && !job.cancelled && pages > 0) {
+			// Undo the small scroll made while loading, so the newest notes show as usual.
+			if (c.isConnected) c.scrollTop = startScrollTop;
+			// From an earlier visit and too many new notes since: just stay with the newest ones.
+			flashToast(t(reason === 'open' && pages >= limit ? 'tooFar' : 'notFound'));
 		} else {
 			hideToast();
 		}
@@ -942,24 +1007,28 @@
 			pages: (n) => `(${n} ${n === 1 ? 'page' : 'pages'} loaded)`,
 			cancel: 'Cancel',
 			notFound: 'Couldn’t find where you left off',
+			tooFar: 'Where you left off is too far back, showing the newest notes',
 		},
 		ja: {
 			restoring: '前回の位置に戻っています…',
 			pages: (n) => `（${n} ページ読み込み済み）`,
 			cancel: 'キャンセル',
 			notFound: '前回の位置が見つかりませんでした',
+			tooFar: '前回の位置は遠すぎるため、最新のノートを表示しています',
 		},
 		'zh-TW': {
 			restoring: '正在回到上次的位置…',
 			pages: (n) => `（已載入 ${n} 頁）`,
 			cancel: '取消',
 			notFound: '找不到上次的位置',
+			tooFar: '上次的位置太久以前了，先顯示最新的貼文',
 		},
 		'zh-CN': {
 			restoring: '正在回到上次的位置…',
 			pages: (n) => `（已加载 ${n} 页）`,
 			cancel: '取消',
 			notFound: '找不到上次的位置',
+			tooFar: '上次的位置太久以前了，先显示最新的帖子',
 		},
 	};
 
@@ -985,6 +1054,22 @@
 		return { v: 1, entries: {} };
 	}
 
+	/** Last-visit positions are per account, so switching accounts doesn't mix them up. */
+	function lastVisitKey() {
+		let account = 'guest';
+		try {
+			// Misskey keeps the signed-in user here; only the id is read.
+			const a = JSON.parse(localStorage.getItem('account') || 'null');
+			if (a && typeof a.id === 'string') account = a.id;
+		} catch { /* not signed in */ }
+		return LAST_VISIT_KEY + location.host + ':' + account;
+	}
+
+	function loadLastVisit() {
+		const v = readJson(safeLocalStorage(), lastVisitKey());
+		return v.v === 1 && v.tabs && typeof v.tabs === 'object' ? v : { v: 1, tabs: {} };
+	}
+
 	let saveTimer = 0;
 	function scheduleSave() {
 		if (!saveTimer) saveTimer = setTimeout(flush, 300);
@@ -1008,6 +1093,34 @@
 		try {
 			sessionStorage.setItem(STORE_KEY, JSON.stringify(store));
 		} catch { /* quota or private mode */ }
+		saveLastVisit();
+	}
+
+	function saveLastVisit() {
+		const ls = safeLocalStorage();
+		if (!ls) return;
+		const key = lastVisitKey();
+		// Other tabs may have saved other timelines meanwhile: keep the newest of each.
+		const saved = readJson(ls, key);
+		const tabs = Object.assign({}, saved.v === 1 && saved.tabs ? saved.tabs : {});
+		for (const [id, snap] of Object.entries(lastVisit.tabs)) {
+			if (!tabs[id] || !(tabs[id].t > snap.t)) tabs[id] = snap;
+		}
+		const ids = Object.keys(tabs).sort((a, b) => tabs[b].t - tabs[a].t);
+		for (const id of ids.slice(MAX_LAST_VISIT)) delete tabs[id];
+		lastVisit = { v: 1, tabs };
+		try {
+			ls.setItem(key, JSON.stringify(lastVisit));
+		} catch { /* quota or private mode */ }
+	}
+
+	/**
+	 * Timelines: the timeline page (all tabs), lists, antennas, channels, and the Explore /
+	 * Discover page (Sharkey's recommendations and featured notes).
+	 */
+	function isTimelinePath(path) {
+		const p = path.split('?')[0].replace(/\/+$/, '') || '/';
+		return /^\/(timeline(\/(list|antenna)\/[^/]+)?|explore)?$/.test(p) || /^\/channels\/[^/]+$/.test(p);
 	}
 
 	function getEntry(key, create) {

@@ -63,6 +63,11 @@ html, body { margin: 0; height: 100%; font: 14px/1.4 sans-serif; }
 	}
 	let newest = BASE;
 	let apiCalls = [];
+	// Notes posted since an earlier visit (the newest ones)
+	for (let i = 0; i < (OPTS.newNotes || 0); i++) {
+		newest += 1000;
+		DB.home.unshift({ id: makeId(newest, 'h1'), text: 'home later ' + i, h: heightOf(serial++) });
+	}
 
 	function api(src, params) {
 		apiCalls.push({ src, ...params });

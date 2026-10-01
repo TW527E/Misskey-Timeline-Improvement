@@ -8,11 +8,11 @@ const MOCK = fs.readFileSync(path.join(__dirname, 'fixtures', 'mock-misskey.html
 const ORIGIN = 'http://misskey.test';
 
 /** Opens the mock client with the userscript injected like `@run-at document-start`. */
-async function open(page, options = {}, html = MOCK) {
+async function open(page, options = {}, html = MOCK, path = '/') {
 	await page.route(ORIGIN + '/**', (route) => route.fulfill({ contentType: 'text/html; charset=utf-8', body: html }));
 	await page.addInitScript((o) => { window.MOCK_OPTIONS = o; }, options);
 	await page.addInitScript({ content: USERSCRIPT });
-	await page.goto(ORIGIN + '/');
+	await page.goto(ORIGIN + path);
 	if (html === MOCK) await page.waitForSelector('[data-scroll-anchor]');
 }
 
@@ -131,9 +131,13 @@ test('each history entry keeps its own position', async ({ page }) => {
 	await open(page, { cache: false });
 	const first = await scrollToNote(page, 30);
 	await openNote(page, first.id);
-	// open the timeline again as a new page (e.g. via the Home button)
+	// open the timeline again as a new page (e.g. via the Home button): it continues from there
+	await markTime(page);
 	await page.evaluate(() => window.mock.router.push('/'));
-	await page.waitForSelector('[data-scroll-anchor]');
+	const resumed = await waitForRestore(page);
+	expect(resumed.reason).toBe('open');
+	expect(resumed.result).toBe('restored');
+	await expectAt(page, first.id, first.top);
 	const second = await scrollToNote(page, 70);
 	await openNote(page, second.id);
 
@@ -244,10 +248,11 @@ test('falls back to the next note when the note you left at was deleted', async 
 	await expectAt(page, next.id, next.top);
 });
 
-test('gives up quickly on feeds that are not ordered by time', async ({ page }) => {
-	await open(page, { cache: false });
+test('does not fetch more of a feed that is not ordered by time', async ({ page }) => {
+	// e.g. recommendations: a rebuilt feed is different, so the old spot can't be found
+	await open(page, { cache: false, infiniteScroll: false });
 	await page.click('.tab:has-text("reco")');
-	await page.waitForSelector('[data-scroll-anchor*="r"]');
+	await page.waitForSelector('[data-scroll-anchor^="r"]');
 	await page.waitForTimeout(300);
 	const before = await scrollToNote(page, 20);
 	await openNote(page, before.id);
@@ -256,10 +261,112 @@ test('gives up quickly on feeds that are not ordered by time', async ({ page }) 
 	await page.goBack();
 	const result = await waitForRestore(page);
 	expect(result.result).toBe('notfound');
-	expect(result.pages).toBeLessThanOrEqual(5);
-	expect(await page.evaluate(() => window.mock.apiCalls.length)).toBeLessThanOrEqual(1 + 5 + 1);
-	await expect(page.locator('.mti-toast')).toBeVisible();
-	await expect(page.locator('.mti-toast')).toBeHidden({ timeout: 5000 });
+	expect(result.pages).toBe(0);
+	expect(await page.evaluate(() => window.mock.apiCalls.length)).toBe(1); // only the feed's own first page
+	await expect(page.locator('.mti-toast')).toBeHidden();
+	expect(await page.evaluate(() => document.querySelector('._pageScrollable').scrollTop)).toBe(0);
+});
+
+test('returns to the spot in a recommendation feed while the page cache still has it', async ({ page }) => {
+	await open(page, { cache: true });
+	await page.click('.tab:has-text("reco")');
+	await page.waitForSelector('[data-scroll-anchor^="r"]');
+	await page.waitForTimeout(300);
+	const before = await scrollToNote(page, 20);
+	await openNote(page, before.id);
+	await markTime(page);
+	await page.goBack();
+	const result = await waitForRestore(page);
+	expect(result.result).toBe('restored');
+	expect(result.pages).toBe(0);
+	await page.waitForTimeout(300);
+	await expectAt(page, before.id, before.top);
+});
+
+test('opening the timeline again later continues where you left off', async ({ context, page }) => {
+	await open(page, { cache: false });
+	const before = await scrollToNote(page, 40);
+	await page.close();
+
+	// a new browser tab: sessionStorage is gone, localStorage is kept
+	const later = await context.newPage();
+	await open(later, { cache: false });
+	const result = await waitForRestore(later);
+	expect(result.reason).toBe('open');
+	expect(result.result).toBe('restored');
+	await expectAt(later, before.id, before.top);
+});
+
+test('the Home button brings you back to the exact spot, also from the page cache', async ({ page }) => {
+	await open(page, { cache: true, nativeRestore: true });
+	const before = await scrollToNote(page, 25, 300);
+	// give Sharkey's (throttled) scroll keeper time to record its own anchor
+	await page.waitForTimeout(1100);
+	await openNote(page, before.id);
+	await markTime(page);
+	await page.evaluate(() => window.mock.router.push('/'));
+	const result = await waitForRestore(page);
+	expect(result.reason).toBe('open');
+	expect(result.result).toBe('restored');
+	expect(result.pages).toBe(0);
+	await page.waitForTimeout(300);
+	await expectAt(page, before.id, before.top);
+});
+
+test('stays with the newest notes when the last visit is too far back', async ({ context, page }) => {
+	await open(page, { cache: false });
+	await scrollToNote(page, 40);
+	await page.close();
+
+	// 400 new notes since then: more than maxLoadPagesOnOpen (10) pages of 30
+	const later = await context.newPage();
+	await open(later, { cache: false, newNotes: 400 });
+	const result = await waitForRestore(later);
+	expect(result.reason).toBe('open');
+	expect(result.result).toBe('notfound');
+	expect(result.pages).toBe(10);
+	await expect(later.locator('.mti-toast')).toContainText('too far back');
+	expect(await later.evaluate(() => document.querySelector('._pageScrollable').scrollTop)).toBe(0);
+});
+
+test('the Explore / Discover page also continues where you left off', async ({ context, page }) => {
+	await open(page, { cache: false }, MOCK, '/explore');
+	const before = await scrollToNote(page, 25);
+	await page.close();
+
+	const later = await context.newPage();
+	await open(later, { cache: false }, MOCK, '/explore');
+	const result = await waitForRestore(later);
+	expect(result.reason).toBe('open');
+	expect(result.result).toBe('restored');
+	await expectAt(later, before.id, before.top);
+});
+
+test('pages that are not timelines (e.g. profiles) start from the top next time', async ({ context, page }) => {
+	await open(page, { cache: false }, MOCK, '/@someone');
+	await scrollToNote(page, 25);
+	await page.close();
+
+	const later = await context.newPage();
+	await open(later, { cache: false }, MOCK, '/@someone');
+	await later.waitForTimeout(1500);
+	expect(await later.evaluate(() => window.__misskeyTimelineImprovement.last)).toBeNull();
+	expect(await later.evaluate(() => document.querySelector('._pageScrollable').scrollTop)).toBe(0);
+});
+
+test('continuing from the last visit can be turned off', async ({ context, page }) => {
+	await open(page, { cache: false });
+	await scrollToNote(page, 40);
+	await page.close();
+
+	const later = await context.newPage();
+	await later.addInitScript(() => {
+		localStorage.setItem('misskey-timeline-improvement:config', JSON.stringify({ restoreOnOpen: false }));
+	});
+	await open(later, { cache: false });
+	await later.waitForTimeout(1500);
+	expect(await later.evaluate(() => window.__misskeyTimelineImprovement.last)).toBeNull();
+	expect(await later.evaluate(() => document.querySelector('._pageScrollable').scrollTop)).toBe(0);
 });
 
 test('does nothing on sites that are not Misskey', async ({ page }) => {
