@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<!--
+	A tiny stand-in for the Misskey / Sharkey web client, reproducing the parts the userscript
+	relies on (modelled on Sharkey 2025.4 / Misskey 2025.x):
+
+	- `._pageContainer > ._pageScrollable` page scroll container (PageWithHeader)
+	- MkStickyContainer: sticky header + `[data-sticky-container-header-height]` body
+	- header tabs where only the selected tab has an extra class
+	- MkTimeline: unit wrappers holding `[data-scroll-anchor="<note id>"]` items,
+	  followed by MkPagination's "load more" button / spinner
+	- a router that calls history.pushState({}) / replaceState({}) and re-renders asynchronously
+	- an optional KeepAlive page cache plus Sharkey's own imprecise scroll keeper
+	  (scrollIntoView({ block: 'center' }) on activation)
+
+	Options are read from window.MOCK_OPTIONS (set by the tests before the page loads).
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="application-name" content="Sharkey">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock Misskey</title>
+<style>
+html, body { margin: 0; height: 100%; font: 14px/1.4 sans-serif; }
+#misskey_app { display: flex; height: 100vh; }
+.nav { width: 72px; flex: none; border-right: 1px solid #ccc; }
+._pageContainer { flex: 1; min-width: 0; height: 100%; }
+._pageScrollable { height: 100%; overflow: clip; overflow-y: scroll; background: #fff; }
+.header { position: sticky; top: 0; z-index: 10; height: 50px; display: flex; align-items: center; gap: 8px; padding: 0 8px; background: #f3f3f3; border-bottom: 1px solid #ddd; box-sizing: border-box; }
+.tabsInner { display: flex; gap: 4px; }
+.tab.x7Ab { font-weight: bold; text-decoration: underline; }
+.postForm { height: 120px; background: #fafafa; border-bottom: 1px solid #ddd; }
+.note { box-sizing: border-box; padding: 8px; border-bottom: 1px solid #ddd; overflow: hidden; }
+.note a { color: inherit; }
+.moreWrap { padding: 16px; text-align: center; }
+.spinner { height: 40px; }
+.notePage { padding: 16px; height: 2000px; }
+</style>
+</head>
+<body>
+<script>
+(() => {
+	const OPTS = Object.assign({
+		cache: true, // KeepAlive-like page cache
+		nativeRestore: true, // Sharkey's own (imprecise) scroll keeper
+		latency: 120, // API latency (ms)
+		firstLimit: 10,
+		moreLimit: 30,
+		infiniteScroll: true,
+		asyncNotes: true, // most notes attach asynchronously, "thread" units synchronously
+	}, window.MOCK_OPTIONS || {});
+
+	// ---- fake server -----------------------------------------------------------------------
+	const BASE = 1700000000000;
+	// aid-style ids: fixed-length base36 timestamp, so string order == time order
+	const makeId = (ms, suffix) => ms.toString(36).padStart(9, '0') + suffix;
+	const heightOf = (n) => 70 + ((n * 7919) % 6) * 37;
+	const DB = { home: [], local: [], reco: [] };
+	let serial = 0;
+	for (let i = 0; i < 1500; i++) {
+		DB.home.push({ id: makeId(BASE - i * 60000, 'h0'), text: 'home #' + i, h: heightOf(serial++), thread: i % 7 === 3 });
+		DB.local.push({ id: makeId(BASE - i * 60000 - 30000, 'l0'), text: 'local #' + i, h: heightOf(serial++), thread: i % 7 === 3 });
+	}
+	let newest = BASE;
+	let apiCalls = [];
+	// Notes posted since an earlier visit (the newest ones)
+	for (let i = 0; i < (OPTS.newNotes || 0); i++) {
+		newest += 1000;
+		DB.home.unshift({ id: makeId(newest, 'h1'), text: 'home later ' + i, h: heightOf(serial++) });
+	}
+
+	function api(src, params) {
+		apiCalls.push({ src, ...params });
+		return new Promise((resolve) => setTimeout(() => {
+			if (src === 'reco') {
+				// Recommendation-like feed: a different random selection every time, offset paging.
+				const out = [];
+				for (let i = 0; i < params.limit; i++) {
+					const n = DB.home[Math.floor(Math.random() * DB.home.length)];
+					const id = 'r' + Math.random().toString(36).slice(2, 12).padEnd(10, '0');
+					out.push({ ...n, id, text: 'reco ' + id });
+				}
+				resolve(out);
+				return;
+			}
+			const arr = DB[src];
+			let start = 0;
+			if (params.untilId) {
+				start = arr.findIndex((n) => n.id < params.untilId);
+				if (start < 0) return resolve([]);
+			}
+			resolve(arr.slice(start, start + params.limit));
+		}, OPTS.latency));
+	}
+
+	// ---- helpers ---------------------------------------------------------------------------
+	const h = (tag, cls, text) => {
+		const el = document.createElement(tag);
+		if (cls) el.className = cls;
+		if (text != null) el.textContent = text;
+		return el;
+	};
+	function throttle(ms, fn) {
+		let last = 0;
+		let timer = 0;
+		return () => {
+			const now = Date.now();
+			if (now - last >= ms) {
+				last = now;
+				fn();
+			} else if (!timer) {
+				timer = setTimeout(() => { timer = 0; last = Date.now(); fn(); }, ms - (now - last));
+			}
+		};
+	}
+
+	// ---- timeline component (MkTimeline + MkPagination) -----------------------------------
+	const store = { tl: 'home' };
+	const liveTimelines = new Set();
+
+	function createTimeline(src, scroller) {
+		const root = h('div', 'pagination');
+		const loading = h('div', 'loading', 'Loading…');
+		root.append(loading);
+		const list = h('div', 'tlRoot');
+		const moreWrap = h('div', 'moreWrap');
+		const btn = h('button', '_button xMore', 'Load more');
+		const spin = h('div', 'spinner', '…');
+		let items = [];
+		let more = false;
+		let fetchingMore = false;
+		let destroyed = false;
+		let observer = null;
+
+		function unit(n) {
+			const wrap = h('div', 'unit');
+			const note = h('div', 'note');
+			note.setAttribute('data-scroll-anchor', n.id);
+			note.style.height = n.h + 'px';
+			const a = h('a', null, n.text);
+			a.href = '/notes/' + n.id;
+			a.addEventListener('click', (ev) => {
+				ev.preventDefault();
+				router.push('/notes/' + n.id);
+			});
+			note.append(a);
+			if (n.thread) {
+				// MkNoteThread renders right away and repeats the ids of its members inside
+				const inner = h('div', 'threadMember');
+				inner.setAttribute('data-scroll-anchor', n.id);
+				note.append(inner);
+				wrap.append(note);
+			} else if (OPTS.asyncNotes) {
+				// Sharkey's DynamicNote is an async component: it shows up a moment later
+				setTimeout(() => wrap.append(note), 20 + Math.floor(Math.random() * 120));
+			} else {
+				wrap.append(note);
+			}
+			return wrap;
+		}
+
+		function renderMore() {
+			moreWrap.replaceChildren(fetchingMore ? spin : btn);
+			moreWrap.style.display = more ? '' : 'none';
+		}
+
+		async function fetchMore() {
+			if (!more || fetchingMore || items.length === 0) return;
+			fetchingMore = true;
+			renderMore();
+			const params = src === 'reco' ? { limit: OPTS.moreLimit, offset: items.length } : { limit: OPTS.moreLimit, untilId: items[items.length - 1].id };
+			const res = await api(src, params);
+			if (destroyed) return;
+			fetchingMore = false;
+			items.push(...res);
+			list.append(...res.map(unit));
+			more = res.length > 0;
+			renderMore();
+		}
+		btn.addEventListener('click', fetchMore);
+
+		const isHead = () => scroller.scrollTop <= 16;
+
+		function prepend(n) {
+			if (!isHead()) return; // queued (not shown) when scrolled down
+			items.unshift(n);
+			list.prepend(unit(n));
+		}
+
+		async function init() {
+			const res = await api(src, { limit: OPTS.firstLimit });
+			if (destroyed) return;
+			items = res;
+			more = res.length > 0;
+			list.replaceChildren(...items.map(unit));
+			loading.remove();
+			root.append(list, moreWrap);
+			renderMore();
+			if (OPTS.infiniteScroll) {
+				observer = new IntersectionObserver((entries) => {
+					if (entries.some((e) => e.isIntersecting)) fetchMore();
+				}, { root: scroller });
+				observer.observe(moreWrap);
+			}
+		}
+		init();
+
+		const tl = {
+			el: root,
+			src,
+			prepend,
+			reload() {
+				// MkPagination.reload(): shows the spinner and rebuilds the list from the top
+				root.replaceChildren(loading);
+				items = [];
+				return init();
+			},
+			destroy() {
+				destroyed = true;
+				if (observer) observer.disconnect();
+				liveTimelines.delete(tl);
+			},
+		};
+		liveTimelines.add(tl);
+		return tl;
+	}
+
+	// ---- pages -----------------------------------------------------------------------------
+	function createTimelinePage() {
+		const el = h('div', '_pageScrollable');
+		const sticky = h('div');
+		const header = h('div', 'header');
+		const tabsInner = h('div', 'tabsInner');
+		header.append(tabsInner);
+		const actions = h('div', 'actions');
+		actions.append(h('button', '_button xAct', '⚙'), h('button', '_button xAct', '✎'));
+		header.append(actions);
+		const body = h('div');
+		body.setAttribute('data-sticky-container-header-height', '50');
+		sticky.append(header, body);
+		el.append(sticky);
+		body.append(h('div', 'postForm', 'post form'));
+		const tlHost = h('div');
+		body.append(tlHost);
+
+		const tabs = ['home', 'local', 'reco'];
+		const buttons = tabs.map((t) => {
+			const b = h('button', '_button xTab tab');
+			const i = h('i', 'ti ti-' + t);
+			b.append(i, h('span', null, t));
+			// Sharkey switches tabs on mousedown
+			b.addEventListener('mousedown', () => switchTab(t));
+			tabsInner.append(b);
+			return b;
+		});
+		function paintTabs() {
+			buttons.forEach((b, i) => b.classList.toggle('x7Ab', tabs[i] === store.tl));
+		}
+
+		let tl = null;
+		function mountTimeline() {
+			if (tl) tl.destroy();
+			tl = createTimeline(store.tl, el);
+			tlHost.replaceChildren(tl.el);
+		}
+		function switchTab(t) {
+			if (store.tl === t) return;
+			store.tl = t;
+			// Vue updates the header and the list in the same flush
+			queueMicrotask(() => {
+				paintTabs();
+				mountTimeline();
+			});
+		}
+		paintTabs();
+		mountTimeline();
+
+		// Sharkey's useScrollPositionKeeper: remembers the note crossing the middle (throttled)
+		// and calls scrollIntoView({ block: 'center' }) on activation.
+		let keeperAnchor = null;
+		let ready = true;
+		el.addEventListener('scroll', throttle(1000, () => {
+			if (!ready) return;
+			const mid = el.getBoundingClientRect().height / 2;
+			const anchors = el.querySelectorAll('[data-scroll-anchor]');
+			for (let i = anchors.length - 1; i >= 0; i--) {
+				const r = anchors[i].getBoundingClientRect();
+				if (r.top <= mid && r.bottom >= mid) {
+					keeperAnchor = anchors[i].getAttribute('data-scroll-anchor');
+					break;
+				}
+			}
+		}), { passive: true });
+
+		return {
+			el,
+			get timeline() { return tl; },
+			switchTab,
+			deactivate() { ready = false; },
+			activate() {
+				if (!OPTS.nativeRestore) return;
+				const restore = () => {
+					if (!keeperAnchor) return;
+					const a = el.querySelector('[data-scroll-anchor="' + keeperAnchor + '"]');
+					if (a) a.scrollIntoView({ behavior: 'instant', block: 'center' });
+				};
+				restore();
+				queueMicrotask(restore);
+				setTimeout(() => { restore(); ready = true; }, 100);
+			},
+			destroy() { if (tl) tl.destroy(); },
+		};
+	}
+
+	function createNotePage(id) {
+		const el = h('div', '_pageScrollable');
+		const sticky = h('div');
+		const header = h('div', 'header', 'Note');
+		const body = h('div');
+		body.setAttribute('data-sticky-container-header-height', '50');
+		const content = h('div', 'notePage', 'Note ' + id);
+		const back = h('button', 'backButton', 'Back');
+		back.addEventListener('click', () => history.back());
+		content.prepend(back);
+		body.append(content);
+		sticky.append(header, body);
+		el.append(sticky);
+		return { el, activate() {}, deactivate() {}, destroy() {} };
+	}
+
+	// ---- router (nirax + RouterView + KeepAlive max=3) -------------------------------------
+	const container = h('div', '_pageContainer');
+	const app = h('div');
+	app.id = 'misskey_app';
+	app.append(h('div', 'nav'), container);
+	document.body.append(app);
+
+	const cache = new Map();
+	let current = null;
+
+	function resolve(path) {
+		const m = path.match(/^\/notes\/(\w+)$/);
+		if (m) return () => createNotePage(m[1]);
+		return () => createTimelinePage();
+	}
+
+	function render(path) {
+		if (current && current.path === path) return;
+		if (current) {
+			current.page.deactivate();
+			current.page.el.remove();
+			if (OPTS.cache) {
+				cache.delete(current.path);
+				cache.set(current.path, current.page);
+				while (cache.size > 3) {
+					const [oldest, page] = cache.entries().next().value;
+					page.destroy();
+					cache.delete(oldest);
+				}
+			} else {
+				current.page.destroy();
+			}
+		}
+		let page = OPTS.cache ? cache.get(path) : null;
+		if (page) {
+			cache.delete(path);
+			container.append(page.el);
+			page.activate();
+		} else {
+			page = resolve(path)();
+			container.append(page.el);
+		}
+		current = { path, page };
+	}
+
+	const router = {
+		push(path) {
+			history.pushState({}, '', path);
+			queueMicrotask(() => render(path));
+		},
+	};
+
+	window.addEventListener('popstate', () => {
+		// Sharkey: mainRouter.replace(location) -> history.replaceState({}, '', path)
+		const path = location.pathname;
+		history.replaceState({}, '', path);
+		queueMicrotask(() => render(path));
+	});
+
+	render(location.pathname);
+
+	// ---- test hooks ------------------------------------------------------------------------
+	window.mock = {
+		router,
+		store,
+		get apiCalls() { return apiCalls; },
+		resetApiCalls() { apiCalls = []; },
+		get page() { return current.page; },
+		/** New notes arrive (pushed to the server and streamed to live timelines). */
+		stream(src, count) {
+			for (let i = 0; i < count; i++) {
+				newest += 1000;
+				const n = { id: makeId(newest, src[0] + '1'), text: src + ' new ' + i, h: heightOf(serial++) };
+				DB[src].unshift(n);
+				for (const tl of liveTimelines) if (tl.src === src) tl.prepend(n);
+			}
+		},
+		deleteNote(id) {
+			for (const k of Object.keys(DB)) DB[k] = DB[k].filter((n) => n.id !== id);
+		},
+	};
+})();
+</script>
+</body>
+</html>
