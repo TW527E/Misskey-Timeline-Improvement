@@ -1,0 +1,18 @@
+{
+  "name": "misskey-timeline-improvement",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Userscript: return to where you left off in Misskey / Sharkey timelines when you go back, like Twitter/X.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TW527E/Misskey-Timeline-Improvement.git"
+  },
+  "scripts": {
+    "check": "node --check misskey-timeline-improvement.user.js",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1"
+  }
+}
